@@ -1,0 +1,131 @@
+原理简述：
+ MySQL Proxy有一项强大功能是实现“读写分离”，基本原理是直接接受客户端的请求，对SQL语句进行分析，让主数据库处理写方面事务，让从库处理SELECT查询。
+
+还有其他功能如可以监视、分析或者传输client与mysql server 之间的通讯，可以做到负载平衡、容错 、分析查询和修正等等
+
+
+
+MySQL主从同步
+原理简述：
+(1) Master将数据改变记录到二进制日志(binary log)中，也就是配置文件log-bin指定的文件，这些记录叫做二进制日志事件(binary log events)；
+
+(2) Slave通过I/O线程读取Master中的binary log events并写入到它的中继日志(relay log)；
+
+(3) Slave通过SQL线程重做中继日志中的事件，把中继日志中的事件信息一条一条的在本地执行一次，完成数据在本地的存储，从而实现将改变反映到它自己的数据(数据重放)
+
+配置：
+主库：192.168.5.158
+
+从库：192.168.5.159
+
+
+
+主库配置
+# mkdir /var/log/mysql/
+# chown -R mysql.mysql /var/log/mysql/
+# vim /etc/my.cnf
+    log-bin                     = /var/log/mysql/mysql-bin    //变更日志位置
+    server_id                   = 1                           //唯一ID
+    expire-logs-days            = 100                         //存放时间
+    replicate-do-db             = zabbix                      //需要同步的数据库
+    binlog-ignore-db            = mysql                       //忽略不同步的数据库
+    auto-increment-increment    = 1
+    auto-increment-offset       = 2
+ 
+ 
+# systemctl restart mysqld
+# mysql -uroot -p
+> GRANT REPLICATION SLAVE ON *.* TO 'mysql'@'192.168.5.159' IDENTIFIED BY 'mysql';      #授权给从数据库服务器
+> flush privileges;
+> show master status;
++------------------+----------+--------------+---------------------------------------------+
+| File             | Position | Binlog_Do_DB | Binlog_Ignore_DB                            |
++------------------+----------+--------------+---------------------------------------------+
+| mysql-bin.000026 |    35508 |              | mysql,information_schema,performance_schema |
++------------------+----------+--------------+---------------------------------------------+
+从库配置
+# mysql -uroot -p
+> CHANGE MASTER TO MASTER_HOST='192.168.5.158',MASTER_PORT=3306,MASTER_USER='mysql',MASTER_PASSWORD='mysql',MASTER_LOG_FILE='mysql-bin.000026',MASTER_LOG_POS=35508;
+> start slave;
+> show slave status\G
+*************************** 1. row ***************************
+               Slave_IO_State: Waiting for master to send event
+                  Master_Host: 192.168.5.158
+                  Master_User: mysql
+                  Master_Port: 3306
+                Connect_Retry: 60
+              Master_Log_File: mysql-bin.000026
+          Read_Master_Log_Pos: 43498
+               Relay_Log_File: mariadb-relay-bin.000009
+                Relay_Log_Pos: 33869
+        Relay_Master_Log_File: mysql-bin.000026
+             Slave_IO_Running: Yes                    #两个显示Yes表明主从同步生效
+            Slave_SQL_Running: Yes
+              Replicate_Do_DB: zabbix
+                ................
+
+
+
+
+MySQL-Proxy
+安装：
+ 源码安装        ------  https://downloads.mysql.com/archives/get/file/mysql-proxy-0.8.5.tar.gz
+
+
+
+安装步骤：
+
+前期依赖准备
+# yum install -y mysql-devel
+# yum install -y lua lua-devel libevent libevent-devel glib2 glib2-devel pkg-config mysqlclient14-devel flex gcc
+
+
+下载安装包、解压编译
+# wget https://downloads.mysql.com/archives/get/file/mysql-proxy-0.8.5.tar.gz
+# tar zxvf mysql-proxy-0.8.5.tar.gz
+# cd mysql-proxy-0.8.5
+# ./configure
+# make; make install
+配置及启动
+# useradd -r mysql-proxy         //添加运行mysql-proxy的用户
+# mysql-proxy --daemon --log-level=debug --user=mysql-proxy --keepalive --log-file=/var/log/mysql-proxy.log --plugins="proxy" --proxy-backend-addresses="192.168.5.158:3306" \
+>              --proxy-read-only-backend-addresses="192.168.5.159:3306" --proxy-lua-script="/usr/local/mysql-proxy-0.8.5/lib/rw-splitting.lua" --plugins=admin \
+>              --admin-username="admin" --admin-password="admin" --admin-lua-script="/usr/local/lib/mysql-proxy/lua/admin.lua"
+/*  启动命令参数解析
+    --user                                                          #运行mysql-proxy进程的用户
+    --keepalive                                                     #在mysql-proxy崩溃时尝试重启之；
+    --plugins=proxy                                                 #在mysql-proxy启动时加载的插件；
+    --proxy-backend-addresses=host:port                             #后端mysql服务器的地址和端口；
+    --proxy-read-only-backend-addresses=host:port                   #后端只读mysql服务器的地址和端口；
+    --proxy-lua-script=file_name                                    #完成mysql代理功能的Lua脚本；
+    --admin-username="admin"                                        #管理员账号
+    --admin-password="admin"                                        #管理员密码
+    --admin-lua-script="/usr/local/lib/mysql-proxy/lua/admin.lua"   #管理员lua脚本
+*/
+测试检查
+# netstat -anlput | grep mysql-proxy
+    tcp        0      0 0.0.0.0:4040            0.0.0.0:*               LISTEN      54342/mysql-proxy      #4040是proxy端口
+    tcp        0      0 0.0.0.0:4041            0.0.0.0:*               LISTEN      54342/mysql-proxy      #4041是admin端口,也就是管理
+# mysql -uzabbix -pzabbix -h 192.168.5.160 --port=4040      //4040端口登陆mysql-proxy
+# mysql -uadmin -padmin -h 192.168.5.160 --port=4041        //4041端口登陆admin
+> select * from backends;
++-------------+--------------------+-------+------+------+-------------------+
+| backend_ndx | address            | state | type | uuid | connected_clients |
++-------------+--------------------+-------+------+------+-------------------+
+|           1 | 192.168.5.158:3306 | up    | rw   | NULL |                 0 |
+|           2 | 192.168.5.159:3306 | up    | ro   | NULL |                 0 |
++-------------+--------------------+-------+------+------+-------------------+
+//两个up表示分离成功（rw-splitting.lua脚本默认有4个链接才启用分离，可以多开启几个终端；也可以去修改里面的相关值；）
+ 
+# vim /usr/local/mysql-proxy-0.8.5/lib/rw-splitting.lua
+    if not proxy.global.config.rwsplit then
+        proxy.global.config.rwsplit = {
+            min_idle_connections = 4,   #修改此处
+            max_idle_connections = 8,
+            is_debug = false
+        }
+    end
+ 
+//可以通过抓包来查看mysql的操作信息
+# tcpdump -i eth0 -nn -XX ip dst host 192.168.5.158 and tcp dst port 3306
+# tcpdump -i eth0 -nn -XX ip dst host 192.168.5.159 and tcp dst port 3306
